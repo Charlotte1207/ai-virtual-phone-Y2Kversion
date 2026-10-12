@@ -9,8 +9,9 @@ export type DrawingBrush = "pen" | "pencil" | "watercolor";
 export type DrawingPoint = [number, number, number];
 export type DrawingStroke = { id: string; author: string; color: string; width: number; brush?: DrawingBrush; opacity?: number; points: DrawingPoint[]; intent?: string; seed: number };
 export type DrawingComment = { author: string; name: string; text: string; atStroke?: number; createdAt?: number };
-export type DrawingSnapshot = { version: 1; createdAt: number; mode: "solo" | "together"; strokes: DrawingStroke[]; comments: DrawingComment[] };
-export type DrawingDraft = { strokes: DrawingStroke[]; mode: "solo" | "together"; characterId: string; comments?: DrawingComment[] };
+export type DrawingSnapshot = { version: 1; createdAt: number; mode: "solo" | "together"; painterIds?: string[]; strokes: DrawingStroke[]; comments: DrawingComment[] };
+export type DrawingDraft = { strokes: DrawingStroke[]; mode: "solo" | "together"; characterId: string; painterIds?: string[]; comments?: DrawingComment[] };
+export const DRAWING_BRUSH_RULES = `默认参考用户近期实际落笔的brush、width和opacity，选择相近的笔刷、粗细与透明度，使新增笔迹与画面协调。用户近期混用笔触时，参考与你要衔接的局部相近的笔迹。只有具体创作意图需要刻画细节、铺色或有意对比时才调整，并在intent中简短记录原因。没有用户笔迹可参考时，按画面和创作意图选择。示例参数仅说明格式，不是默认笔触；不要无理由回到固定细笔。`;
 export const DRAWING_COMMENT_RULES = `你可以结合角色性格、聊天上下文及实际画板，简短吐槽、互动、猜测或欣赏，不必每次夸奖。不知道用户画什么时用猜测口吻，不编造确定意图，不替用户回答。每轮最多2句，每句不超过100字。评论用独立JSON对象 {"type":"comment","text":"角色说的话"}；也可在笔迹对象加comment字符串，在落笔时说。只输出协议JSON，不输出思考过程。不要重复上一轮评论。`;
 export const DRAWING_WATCH_RULES = `这是单人绘画旁观回合：只有用户画画，你只看，不落笔、不输出points、不能改变画板。用户停笔后发来当前画板快照，你作一句简短评论或猜测，再让用户继续画。不是实时视频，不声称看到了快照之外的动作。用户此时不能打字，不要求其先回答才能继续。${DRAWING_COMMENT_RULES}`;
 export const DRAWING_RULES = `你正在与用户轮流共画。这是一段共同创作的过程，不是一次性完成任务。
@@ -18,11 +19,11 @@ export const DRAWING_RULES = `你正在与用户轮流共画。这是一段共�
 不要敷衍地只划一条无意义短横线，也绝不能替用户画完整个物体、补完所有空白或重画全图。
 例如用户只画了苹果蒂，你可以添一片有轮廓、叶脉和浅色晕染的叶子，或把蒂俏皮地变成小天线；这些相关笔触服务同一个想法。不能一轮把整个苹果、叶子和全部阴影画完。例子不是指定画苹果，也不是限制只能添叶子。
 保持角色性格与绘画水平，允许犹豫、轻微不对称和不规则弧线。表达局部想法而非机械几何。留空间给对方下一轮。
-你和用户都能为每一笔独立选择画笔颜色和粗细，不必沿用上一笔或用户的选择。共同画笔色板为${DRAWING_PALETTE.join("、")}，粗细参考为${DRAWING_WIDTHS.join("、")}（细、中、粗）；也可在协议范围内自行选其他颜色与粗细。示例中的黑色和宽度不是默认要求。
-结合角色性格、关系、上下文和眼前画面，自主决定认真配合、玩耍、恶搞或出其不意；不强制配合，也不强制恶搞。可以沿用用户的粗细/自然配色，也可以故意换笔、用夸张或反常颜色。一个创作意图内也能换笔触、颜色、粗细和透明度：如细铅笔勾边后换宽水彩铺色。每条JSON独立写出实际brush、color、width、opacity，不能只在文字里说换笔而不改参数。intent简短记录本条实际添什么及用笔选择；相关笔迹服务同一个创作意图，把后续发展留给用户。
+${DRAWING_BRUSH_RULES}
+结合角色性格、关系、上下文和眼前画面决定添什么。共同画笔色板为${DRAWING_PALETTE.join("、")}，也可自行选择其他颜色。每条JSON写出实际brush、color、width、opacity，数值字段使用JSON数字；intent简短记录本条实际添什么，相关笔迹服务同一个创作意图，把后续发展留给用户。
 画板为600×800竖屏白纸，x向右、y向下。每条笔迹输出一个独立JSON对象，换行分隔，不用Markdown、不输出SVG，不调用其他聊天动作。
 格式：{"intent":"给叶子勾不规则边缘，细铅笔轻压","brush":"pencil","color":"#428e70","width":4,"opacity":0.8,"comment":"我给它长片歪叶子，再铺一点水彩。","points":[[100,200,0.4],[103,204,0.6],[110,210,0.5]]}
-每笔还可指定brush（pen原手绘线条、pencil颗粒铅笔、watercolor柔边水彩）和opacity（0.05到1，越小越透明）。你和用户使用相同工具，颜色可自由选任意#RRGGBB，width为1到${DRAWING_MAX_WIDTH}画板像素：细笔勾线，宽笔铺色；水彩本身有半透明叠色质感。比如{"brush":"watercolor","color":"#ed739b","width":40,"opacity":0.35,"intent":"添一小块粉色晕染","points":[[200,200,0.5],[230,210,0.6]]}。自行决定用笔，不必跟随用户。
+每笔还可指定brush（pen原手绘线条、pencil颗粒铅笔、watercolor柔边水彩）和opacity（0.05到1，越小越透明）。你和用户使用相同工具，颜色可自由选任意#RRGGBB，width为1到${DRAWING_MAX_WIDTH}画板像素：细笔勾线，宽笔铺色；水彩本身有半透明叠色质感。比如{"brush":"watercolor","color":"#ed739b","width":40,"opacity":0.35,"intent":"添一小块粉色晕染","points":[[200,200,0.5],[230,210,0.6]]}。
 points每项为[x,y,压力0.1到1]，2到80个点，坐标必须在画板内。每条笔迹连续落笔，不要跨越远距离连线；抬笔就换下一个JSON对象。用户可能连续画了多笔才交棒，结合整块画板而非只看最后一条。
 整轮总路径长度最多${DRAWING_TURN_MAX_LENGTH}画板像素，最多${DRAWING_TURN_MAX_STROKES}条笔迹，每条仍最多750像素。上限只是防止一轮霸占画板，不是目标；允许想法完整可辨，但不把整幅画做完。先尽快输出第一条实际笔迹，别先输出长篇计划。第一条笔迹的comment用角色口吻简短说明这一轮想添什么，可顺带说有意义的换笔/配色选择，不必机械报参数；后续可有一句互动，不必每笔解释。只画本轮新增笔迹，已有的不要重复。
 ${DRAWING_COMMENT_RULES} 共画时可以边画边说，将comment附在笔迹对象上更合适；评论不能代替本轮落笔，也别用长篇评论拖延落笔。`;

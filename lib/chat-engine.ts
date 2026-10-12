@@ -1801,7 +1801,7 @@ export function buildNativeChatTools(enabledTools: EnabledTool[], expandedSource
         if (isNativeSingleTool(tool)) {
             const sourceKey = nativeToolSourceKey(tool);
             registerTool(tool.name, tool.description, tool.parameterSchema || "{}", sourceKey, tool.usageGuide);
-        } else {
+        } else if (!expanded.has(nativeToolSourceKey(tool))) {
             registerLoader(tool);
         }
     }
@@ -1868,7 +1868,7 @@ export function formatNativeChatToolResult(result: ToolResult): string {
 }
 
 export function formatNativeLoaderToolResult(label: string): string {
-    return `已展开「${label}」动作说明。`;
+    return `已展开「${label}」动作说明。无需再次加载，请使用当前工具列表中的具体动作，或直接回复。`;
 }
 
 export function nativeChatToolCallToTextCall(call: LlmToolCall, bundle: NativeChatToolBundle): ToolCall {
@@ -2266,6 +2266,8 @@ async function generateNativeChatCompletion(
         userName: userIdentity?.name ?? "用户",
     };
     let nativeBundle = buildNativeChatTools(enabledTools, expandedSourceIds, nativeToolBuildOptions);
+    // Retain loader recognition after expansion removes it from the offered tools.
+    const loaderCatalog = buildNativeChatTools(enabledTools, [], nativeToolBuildOptions).loaderMap;
     const requestMessages: LlmRequestMessage[] = toLlmRequestMessages(llmMessages);
     const parts: ChatCompletionPart[] = [];
     const meta = { characterName: character.name, userName: userIdentity?.name };
@@ -2371,17 +2373,13 @@ async function generateNativeChatCompletion(
             parts.push({ text: afterActionStrip });
         }
 
-        const loaderCalls = result.toolCalls
-            .map(call => ({ call, loader: nativeBundle.loaderMap.get(call.name) }))
-            .filter((item): item is { call: LlmToolCall; loader: { sourceKey: string; label: string } } => Boolean(item.loader));
-        const realNativeCalls = result.toolCalls.filter(call => !nativeBundle.loaderMap.has(call.name));
+        const realNativeCalls = result.toolCalls.filter(call => !loaderCatalog.has(call.name) && nativeBundle.realToolSourceMap.has(call.name));
         const textCalls = realNativeCalls.map((call) => nativeChatToolCallToTextCall(call, nativeBundle));
-        const displayedActionNames = [
-            ...loaderCalls.map(item => `展开「${item.loader.label}」动作说明`),
+        const displayedActionNames = [...new Set([
             ...realNativeCalls.map(call => nativeBundle.displayNameMap.get(call.name) || nativeBundle.nameMap.get(call.name) || call.name),
-        ];
+        ])];
         const actorName = character.name;
-        callbacks?.onToolNotice?.(`${actorName}正在${displayedActionNames.join("、")}...`);
+        if (displayedActionNames.length > 0) callbacks?.onToolNotice?.(`${actorName}正在${displayedActionNames.join("、")}...`);
 
         let realResults: Awaited<ReturnType<typeof executeToolCalls>> = [];
         try {
@@ -2453,12 +2451,16 @@ async function generateNativeChatCompletion(
         }> = [];
         let realResultIndex = 0;
         let expandedChanged = false;
+        const expandedThisRound = new Set<string>();
 
         for (const nativeCall of result.toolCalls) {
-            const loader = nativeBundle.loaderMap.get(nativeCall.name);
+            const loader = loaderCatalog.get(nativeCall.name);
             if (loader) {
-                expandedSourceIds = touchNativeExpandedToolSource(expandedSourceIds, loader.sourceKey);
-                expandedChanged = true;
+                if (!expandedThisRound.has(loader.sourceKey) && !expandedSourceIds.includes(loader.sourceKey)) {
+                    expandedThisRound.add(loader.sourceKey);
+                    expandedSourceIds = touchNativeExpandedToolSource(expandedSourceIds, loader.sourceKey);
+                    expandedChanged = true;
+                }
                 const content = formatNativeLoaderToolResult(loader.label);
                 outcomes.push({
                     nativeCall,
@@ -2471,6 +2473,12 @@ async function generateNativeChatCompletion(
                     },
                     formattedContent: content,
                 });
+                continue;
+            }
+
+            if (!nativeBundle.realToolSourceMap.has(nativeCall.name)) {
+                const invalid: ToolResult = { name: "不可用动作", success: false, error: "此动作不在当前工具列表中，请使用已提供的动作。" };
+                outcomes.push({ nativeCall, result: invalid, formattedContent: formatNativeChatToolResult(invalid) });
                 continue;
             }
 
@@ -2500,7 +2508,7 @@ async function generateNativeChatCompletion(
             nativeBundle = buildNativeChatTools(enabledTools, expandedSourceIds, nativeToolBuildOptions);
         }
 
-        const notices = outcomes.map(item => (
+        const notices = outcomes.filter(item => item.realResult).map(item => (
             item.result.userNotice || (item.result.success ? `✓ ${item.result.name} 执行成功` : `✗ ${item.result.name}: ${item.result.error}`)
         )).filter(Boolean).join("；");
         throwIfAborted(options?.signal);

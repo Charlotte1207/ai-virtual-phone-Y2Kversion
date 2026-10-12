@@ -303,7 +303,7 @@ export type GroupChatPromptBuildOptions = {
     apiConfigId?: string;
 };
 
-async function buildGroupChatPromptMessages(
+export async function buildGroupChatPromptMessages(
     session: ChatSession,
     history: ChatMessage[],
     options?: GroupChatPromptBuildOptions,
@@ -639,6 +639,7 @@ async function runNativeGroupToolLoop(params: {
         userName: params.userName,
     };
     let nativeBundle = buildNativeChatTools(enabledTools, expandedSourceIds, nativeToolBuildOptions);
+    const loaderCatalog = buildNativeChatTools(enabledTools, [], nativeToolBuildOptions).loaderMap;
     const requestMessages: LlmRequestMessage[] = toLlmRequestMessages(llmMessages);
     const meta = { characterName: `群聊:${session.groupName || "群聊"}`, userName: params.userName };
     const expandableSourceKeys = new Set(enabledTools.filter(tool => !isNativeSingleTool(tool)).map(nativeToolSourceKey));
@@ -707,18 +708,17 @@ async function runNativeGroupToolLoop(params: {
         });
 
         const loaderCalls = result.toolCalls
-            .map(call => ({ call, loader: nativeBundle.loaderMap.get(call.name) }))
+            .map(call => ({ call, loader: loaderCatalog.get(call.name) }))
             .filter((item): item is { call: LlmToolCall; loader: { sourceKey: string; label: string } } => Boolean(item.loader));
-        const realNativeCalls = result.toolCalls.filter(call => !nativeBundle.loaderMap.has(call.name));
+        const realNativeCalls = result.toolCalls.filter(call => !loaderCatalog.has(call.name) && nativeBundle.realToolSourceMap.has(call.name));
         const textCalls = realNativeCalls.map(call => nativeGroupToolCallToTextCall(call, nativeBundle));
         const actorNames = [...new Set([
             ...loaderCalls.map(item => getNativeGroupActorName(item.call)),
             ...textCalls.map(call => call.actor),
         ].map(name => name?.trim()).filter(Boolean))].join("、") || "未标注角色";
-        const displayedActionNames = [
-            ...loaderCalls.map(item => `展开「${item.loader.label}」动作说明`),
+        const displayedActionNames = [...new Set([
             ...realNativeCalls.map(call => nativeBundle.displayNameMap.get(call.name) || nativeBundle.nameMap.get(call.name) || call.name),
-        ];
+        ])];
         if (displayedActionNames.length > 0) callbacks?.onToolNotice?.(`${actorNames}正在${displayedActionNames.join("、")}...`);
 
         let realResults: Awaited<ReturnType<typeof executeToolCalls>> = [];
@@ -752,12 +752,16 @@ async function runNativeGroupToolLoop(params: {
         }> = [];
         let realResultIndex = 0;
         let expandedChanged = false;
+        const expandedThisRound = new Set<string>();
 
         for (const nativeCall of result.toolCalls) {
-            const loader = nativeBundle.loaderMap.get(nativeCall.name);
+            const loader = loaderCatalog.get(nativeCall.name);
             if (loader) {
-                expandedSourceIds = touchNativeExpandedToolSource(expandedSourceIds, loader.sourceKey);
-                expandedChanged = true;
+                if (!expandedThisRound.has(loader.sourceKey) && !expandedSourceIds.includes(loader.sourceKey)) {
+                    expandedThisRound.add(loader.sourceKey);
+                    expandedSourceIds = touchNativeExpandedToolSource(expandedSourceIds, loader.sourceKey);
+                    expandedChanged = true;
+                }
                 const content = formatNativeLoaderToolResult(loader.label);
                 outcomes.push({
                     nativeCall,
@@ -770,6 +774,12 @@ async function runNativeGroupToolLoop(params: {
                     },
                     formattedContent: content,
                 });
+                continue;
+            }
+
+            if (!nativeBundle.realToolSourceMap.has(nativeCall.name)) {
+                const invalid = { name: "不可用动作", success: false, error: "此动作不在当前工具列表中，请使用已提供的动作。" };
+                outcomes.push({ nativeCall, result: invalid, formattedContent: formatNativeChatToolResult(invalid) });
                 continue;
             }
 
@@ -798,7 +808,7 @@ async function runNativeGroupToolLoop(params: {
             nativeBundle = buildNativeChatTools(enabledTools, expandedSourceIds, nativeToolBuildOptions);
         }
 
-        const notices = outcomes.map(item => (
+        const notices = outcomes.filter(item => realNativeCalls.some(call => call === item.nativeCall)).map(item => (
             item.result.userNotice || (item.result.success ? `✓ ${item.result.name} 执行成功` : `✗ ${item.result.name}: ${item.result.error}`)
         )).filter(Boolean).join("；");
         throwIfAborted(signal);
