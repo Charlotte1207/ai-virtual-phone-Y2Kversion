@@ -456,8 +456,11 @@ export function isSystemInstructionMessage(msg: Pick<ChatMessage, "role" | "medi
 export function getChatMessagePreview(msg: ChatMessage): string {
     if (isReadingDiscussMessage(msg)) return "";
 
-    const userName = (() => { try { return resolveUserIdentity()?.name; } catch { return undefined; } })();
-    const toYou = (text: string) => userName ? text.replace(new RegExp(userName, "g"), "你") : text;
+    const getUserName = () => { try { return resolveUserIdentity()?.name; } catch { return undefined; } };
+    const toYou = (text: string) => {
+        const userName = getUserName();
+        return userName ? text.replace(new RegExp(userName, "g"), "你") : text;
+    };
 
     // Retracted: "你/对方撤回了一条消息"
     if (msg.isRetracted) return (msg.role === "user" ? "你" : "对方") + "撤回了一条消息";
@@ -509,6 +512,7 @@ export function getChatMessagePreview(msg: ChatMessage): string {
 
     // Poke: "你 拍了拍 XX" / "XX 拍了拍 你" (no brackets, user name → "你")
     if (msg.mediaType === "poke") {
+        const userName = getUserName();
         const sender = msg.mediaData?.pokeSender || (msg.role === "user" ? "你" : "对方");
         const target = msg.mediaData?.pokeTarget || (msg.role === "user" ? "对方" : "你");
         const dSender = (userName && sender === userName) ? "你" : sender;
@@ -539,6 +543,7 @@ export function getChatMessagePreview(msg: ChatMessage): string {
         // Call initiation: [我向XX发起了语音通话] → 你/对方发起了语音通话
         const initiate = c.match(/\[我向(.+?)发起了((?:语音|视频)通话)\]/);
         if (initiate) {
+            const userName = getUserName();
             const target = initiate[1];
             if (userName && target === userName) return `对方发起了${initiate[2]}`;
             return `你发起了${initiate[2]}`;
@@ -1169,6 +1174,12 @@ export function removeChatContact(characterId: string) {
 }
 
 // ── CRUD for Sessions ─────────────────────────
+/** Read current session metadata without scanning messages or refreshing previews.
+ * Treat the returned snapshot as read-only; hydration/imports replace the live cache. */
+export function getChatSessionMetadata(): readonly ChatSession[] {
+    return _sessionsCache;
+}
+
 export function loadChatSessions(): ChatSession[] {
     const normalized = normalizeChatSessions(_sessionsCache);
     const redirectedMessages = redirectMessagesToPreferredSessions(normalized.redirects);

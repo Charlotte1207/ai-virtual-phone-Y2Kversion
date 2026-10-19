@@ -41,6 +41,8 @@ const PRIMARY_DATA_MODULES: DataModuleDefinition[] = [
         label: "聊天设置与待处理状态",
         keys: [
           "ai_phone_chat_settings_v1",
+          "chat-app-character-avatars-v1",
+          "chat-bubble-color-settings-v1",
           "ai_phone_photo_album_v1",
           "ai_phone_album_permissions_v1",
           "ai_phone_album_discussions_v1",
@@ -57,6 +59,8 @@ const PRIMARY_DATA_MODULES: DataModuleDefinition[] = [
           "chat_plugin_errors_v1",
         ],
         prefixes: [
+          "ai_phone_album_discussion_v2:",
+          "ai_phone_album_legacy_media_v1:",
           "chat-generating:",
           "pending_reply_",
           "ai_phone_chat_offline_turns:",
@@ -181,7 +185,7 @@ const PRIMARY_DATA_MODULES: DataModuleDefinition[] = [
       {
         type: "kv",
         label: "记忆配置与计数",
-        keys: ["ai_phone_memory_config_v1"],
+        keys: ["ai_phone_memory_config_v1", "ai_phone_memory_entry_pins_v1"],
         prefixes: [
           "ai_phone_mem_evt_count_",
           "ai_phone_mem_last_sum_",
@@ -264,6 +268,7 @@ const PRIMARY_DATA_MODULES: DataModuleDefinition[] = [
           "music_queue_v1",
           "music_track_playlist_map_v1",
           "music-playlists-cache",
+          "listening-library-v1",
           "music-recommend-daily",
           "music-recommend-fm",
           "music-recommend-playlists",
@@ -381,18 +386,19 @@ export const DATA_MODULES: DataModuleDefinition[] = [
   {
     id: "cache",
     label: "缓存与未分类数据",
-    description: "浏览器遗留键、临时状态，以及尚未显式归类的键值数据",
+    description: "尚未分类的数据会纳入备份；为保护长期记录，不参与缓存清理",
     variant: "warning",
     large: true,
     sources: [
       {
         type: "kv",
         label: "未分类键值数据",
+        preserveOnClear: true,
         includeAll: true,
         excludeKeys: [...ownedKvKeys, ...KV_BACKUP_EXCLUDED_KEYS],
         excludePrefixes: ownedKvPrefixes,
       },
-      { type: "localStorage", label: "浏览器遗留缓存", includeAll: true, excludeKeys: RESERVED_LOCAL_STORAGE_KEYS },
+      { type: "localStorage", label: "浏览器遗留数据", preserveOnClear: true, includeAll: true, excludeKeys: RESERVED_LOCAL_STORAGE_KEYS },
     ],
   },
 ];

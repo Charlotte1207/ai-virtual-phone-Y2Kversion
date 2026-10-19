@@ -1,13 +1,15 @@
-import { kvGet, kvSet, registerKvMigration } from "./kv-db";
-import { loadChatMessages, loadChatSessions } from "./chat-storage";
+import { kvGet, kvSet, kvKeysWithPrefix, migrateKvRecords, registerKvMigration, registerDynamicPrefix } from "./kv-db";
+import { loadChatMessages, getChatSessionMetadata } from "./chat-storage";
 import { collectPhotoAlbumAssets, type PhotoAlbumAsset } from "./photo-album-storage";
 import { getAlbumPermission } from "./photo-album-permissions";
-import { contentVersionOf, variantVersionOf, photoIdOf, getPhotoDefinition, getPhotoSeen, photoSeenBy, photoFactContext, reconcilePhotoAccess, recordPhotoSeen } from "./photo-album-core";
+import { refKey, contentVersionOf, variantVersionOf, photoIdOf, getPhotoDefinition, getPhotoSeen, photoSeenBy, photoFactContext, reconcilePhotoAccess, recordPhotoSeen } from "./photo-album-core";
 
 const KEY = "ai_phone_album_discussions_v1";
 export const ALBUM_DISCUSSION_UPDATED = "album-discussion-updated";
 export const ALBUM_REVIEW_REQUESTED = "album-review-requested";
 registerKvMigration(KEY);
+const PREFIX = "ai_phone_album_discussion_v2:";
+registerDynamicPrefix(PREFIX);
 
 export type AlbumComment = {
   id: string; authorId: string; authorName: string; text: string;
@@ -45,27 +47,84 @@ export function rerollAlbumThought(asset: PhotoAlbumAsset, characterId: string):
 }
 let discussionRaw: string | undefined;
 let discussionCache: Record<string, AlbumDiscussion> = {};
+let mergedCache: Record<string, AlbumDiscussion> = {};
+const rowCache = new Map<string, { raw: string | null; thread?: AlbumDiscussion }>();
+let legacyValid = true;
+let migrating = false;
+let retryAfter = 0;
+function compactThread(thread: AlbumDiscussion): AlbumDiscussion {
+  return { ...thread, mediaRef: refKey(thread.mediaRef), contentVersion: refKey(thread.contentVersion),
+    archived: thread.archived?.map(item => ({ ...item, contentVersion: refKey(item.contentVersion) })) };
+}
+async function migrateDiscussions(raw: string, old: Record<string, AlbumDiscussion>): Promise<void> {
+  const records: Array<{ key: string; value: string }> = [];
+  for (const thread of Object.values(old)) {
+    if (!thread?.assetId) throw new Error("旧相册讨论缺少标识，保留原数据");
+    const compact = compactThread(thread);
+    if (thread.mediaRef?.startsWith("data:")) {
+      const { storeMediaBlob, loadMediaBlob } = await import("./media-cache-storage");
+      const id = `album-legacy-${encodeURIComponent(thread.assetId)}-${compact.mediaRef}`;
+      let ref = `media-store://${id}`;
+      if (!(await loadMediaBlob(ref))) {
+        const blob = await (await fetch(thread.mediaRef)).blob();
+        ref = await storeMediaBlob(blob, blob.type, "image", id);
+        if ((await loadMediaBlob(ref))?.blob.size !== blob.size) throw new Error("相册图片迁移校验失败");
+      }
+      // A separate durable reference also preserves photos whose original chat
+      // has since been removed. New discussion edits cannot overwrite this row.
+      records.push({ key: `ai_phone_album_legacy_media_v1:${encodeURIComponent(thread.assetId)}`, value: JSON.stringify({ mediaRef: ref, contentVersion: compact.contentVersion, fingerprint: compact.mediaRef }) });
+    }
+    records.push({ key: PREFIX + encodeURIComponent(thread.assetId), value: JSON.stringify(compact) });
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  await migrateKvRecords(KEY, raw, records);
+}
 export function loadAlbumDiscussions(): Record<string, AlbumDiscussion> {
   const raw = kvGet(KEY) || "{}";
+  let changed = raw !== discussionRaw;
   if (raw !== discussionRaw) {
-    try { discussionCache = JSON.parse(raw); } catch { discussionCache = {}; }
+    try {
+      const parsed = JSON.parse(raw);
+      legacyValid = Boolean(parsed && typeof parsed === "object" && !Array.isArray(parsed));
+      discussionCache = legacyValid ? parsed : {};
+    } catch { discussionCache = {}; legacyValid = false; }
     discussionRaw = raw;
   }
-  return discussionCache;
+  const keys = new Set(kvKeysWithPrefix(PREFIX));
+  for (const key of rowCache.keys()) if (!keys.has(key)) { rowCache.delete(key); changed = true; }
+  for (const key of keys) {
+    const value = kvGet(key);
+    if (rowCache.get(key)?.raw === value) continue;
+    changed = true;
+    try { rowCache.set(key, { raw: value, thread: JSON.parse(value || "null") }); }
+    catch { rowCache.set(key, { raw: value }); }
+  }
+  if (changed) {
+    mergedCache = { ...discussionCache };
+    for (const { thread } of rowCache.values()) if (thread?.assetId) mergedCache[thread.assetId] = thread;
+  }
+  if (legacyValid && !migrating && Date.now() >= retryAfter && raw !== "{}") {
+    migrating = true;
+    void migrateDiscussions(raw, discussionCache).then(() => {
+      if (discussionRaw === raw && !kvGet(KEY)) {
+        discussionRaw = undefined; discussionCache = {}; mergedCache = {}; rowCache.clear();
+      }
+    }).catch(error => {
+      retryAfter = Date.now() + 60_000;
+      console.warn("[Album] migration pending; legacy retained", error);
+    }).finally(() => { migrating = false; });
+  }
+  return mergedCache;
 }
 export function saveAlbumDiscussion(thread: AlbumDiscussion): void {
-  const all = { ...loadAlbumDiscussions() };
-  all[thread.assetId] = thread;
-  kvSet(KEY, JSON.stringify(all));
-  discussionRaw = kvGet(KEY) || "{}";
-  discussionCache = all;
+  kvSet(PREFIX + encodeURIComponent(thread.assetId), JSON.stringify(compactThread(thread)));
   if (typeof window !== "undefined") window.dispatchEvent(new Event(ALBUM_DISCUSSION_UPDATED));
 }
 export function getAlbumDiscussion(asset: PhotoAlbumAsset): AlbumDiscussion {
   const thread = loadAlbumDiscussions()[asset.id];
   // Legacy discussions are adopted only while still pointing to their original pixels.
-  if (thread && (thread.contentVersion ? thread.contentVersion === contentVersionOf(asset) : thread.mediaRef === asset.mediaRef && thread.label === asset.label)) return { ...thread, contentVersion: contentVersionOf(asset), mediaRef: asset.mediaRef, label: asset.label };
-  return { assetId: asset.id, contentVersion: contentVersionOf(asset), mediaRef: asset.mediaRef, label: asset.label, comments: [], reviewed: {}, dueAt: 0,
+  if (thread && (thread.contentVersion ? refKey(thread.contentVersion) === contentVersionOf(asset) : refKey(thread.mediaRef) === refKey(asset.mediaRef) && thread.label === asset.label)) return { ...thread, contentVersion: contentVersionOf(asset), mediaRef: refKey(asset.mediaRef), label: asset.label };
+  return { assetId: asset.id, contentVersion: contentVersionOf(asset), mediaRef: refKey(asset.mediaRef), label: asset.label, comments: [], reviewed: {}, dueAt: 0,
     archived: thread ? [...(thread.archived || []), { contentVersion: thread.contentVersion, comments: thread.comments }].slice(-5) : [] };
 }
 export function albumParticipants(asset: PhotoAlbumAsset): string[] {
@@ -74,7 +133,7 @@ export function albumParticipants(asset: PhotoAlbumAsset): string[] {
     return permission.availableAt <= Date.now() ? permission.characterIds : [];
   }
   const sessionId = asset.source.sessionId;
-  const session = loadChatSessions().find(s => s.id === sessionId);
+  const session = getChatSessionMetadata().find(s => s.id === sessionId);
   return session ? [...new Set(session.isGroup ? session.participantIds || [] : [session.contactId])] : [];
 }
 export function queueAlbumReview(asset: PhotoAlbumAsset, snapshot?: PhotoAlbumAsset[]): void {

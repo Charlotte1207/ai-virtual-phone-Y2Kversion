@@ -2,18 +2,18 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const ts = require('typescript');
-let stored = '{}';
+let stored = '{}'; const values = new Map();
 const {core,data:coreData} = require('./album-core-test-helper.cjs')();
 let permission = {characterIds:[],revision:'private',availableAt:0};
 let assets = [{ id: 'chat:s:p', source: { kind: 'chat', sessionId: 's', messageId: 'p' }, mediaRef: 'photo-v1', label: '早餐', createdAt: '2026-09-19', baseAnnotations: [], albumAnnotations: [] }];
 const modules = {
   './photo-album-core':core,
   './photo-album-permissions': {getAlbumPermission:()=>permission},
-  './kv-db': { kvGet: () => stored, kvSet: (_, v) => stored = v, registerKvMigration() {} },
-  './chat-storage': { loadChatSessions: () => [{ id: 's', contactId: 'char' }], loadChatMessages: () => [{id: 'p', content: '早餐', role: 'user'}] },
+  './kv-db': { kvGet: k => k === 'ai_phone_album_discussions_v1' ? stored : values.get(k), kvSet: (k, v) => values.set(k,v), kvKeysWithPrefix: p => [...values.keys()].filter(k=>k.startsWith(p)), registerKvMigration() {}, registerDynamicPrefix() {}, migrateKvRecords: async()=>{}  },
+  './chat-storage': { loadChatSessions: () => { throw new Error("Album must not scan every chat history"); }, getChatSessionMetadata: () => [{ id: 's', contactId: 'char' }], loadChatMessages: () => [{id: 'p', content: '早餐', role: 'user'}] },
   './photo-album-storage': { collectPhotoAlbumAssets: () => assets },
 };
-const sandbox = { exports: {}, require: k => modules[k], Date, Math, JSON, Set, window: undefined };
+const sandbox = { exports: {}, require: k => modules[k], Date, Math, JSON, Set, setTimeout, console, window: undefined };
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('lib/photo-album-discussion.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, sandbox);
 const d = sandbox.exports, asset = assets[0];
 const cached = d.loadAlbumDiscussions();
@@ -39,7 +39,7 @@ assert.equal(d.albumDiscussionMemory('char').length, 0, 'Removed source photos c
 console.log('PASS: discussion persistence, delayed review, access boundaries and replacement isolation');
 
 (async () => {
- assets = [asset]; stored = '{}';
+ assets = [asset]; stored = '{}'; values.clear();
  d.addUserAlbumComment(asset, '测试新评论');
  d.saveAlbumDiscussion({...d.getAlbumDiscussion(asset), dueAt: 1});
  let calls = 0;
@@ -49,7 +49,7 @@ console.log('PASS: discussion persistence, delayed review, access boundaries and
   './photo-album-permissions': modules['./photo-album-permissions'],
   './photo-album-discussion': d,
   './photo-album-storage': {collectPhotoAlbumAssets:()=>assets},
-  './character-storage': {loadCharacters:()=>[{id:'char',name:'角色',persona:'测试'}]},
+  './character-storage': {loadInteractableCharacters:()=>[{id:'char',name:'角色',persona:'测试'}]},
   './settings-storage': {loadApiConfigs:()=>[{id:'api'}],loadBindingConfig:()=>({}),resolveBinding:()=>({apiConfigId:'api'}),loadPresets:()=>[],loadRegexes:()=>[],loadWorldBooks:()=>[],resolveUserIdentity:()=>({name:'用户'})},
   './llm-prompt-assembler': {assemblePromptPayload:()=>[]},
   './chat-engine': {sendLLMRequest:async()=>{calls++;return JSON.stringify({thought:'今天的早餐不错。',reply:'留了一份给你。'});}},
@@ -72,7 +72,7 @@ console.log('PASS: discussion persistence, delayed review, access boundaries and
  d.markAlbumRepliesRead(asset);
  assert.equal(d.unreadAlbumReplies(asset),0);
  // No user comment or detail-page visit is needed for the initial thought.
- stored='{}';
+ stored='{}'; values.clear();
  await engine.exports.reviewNextAlbumPhoto();
  assert.equal(d.getAlbumDiscussion(asset).comments.length,1);
  assert.equal(d.getAlbumDiscussion(asset).comments[0].kind,'thought');
@@ -124,9 +124,9 @@ console.log('PASS: discussion persistence, delayed review, access boundaries and
  await engine.exports.reviewNextAlbumPhoto();
  assert.ok(!d.loadAlbumDiscussions()[asset.id].comments.some(c=>c.text==='过期结果'),'Removed photos must reject in-flight replies');
  console.log('PASS: mocked character review, thought/reply persistence, idempotence and stale result protection');
- assets=[{...asset,conversation:{kind:'group'}}];stored='{}';
- modules['./chat-storage'].loadChatSessions=()=>[{id:'s',isGroup:true,participantIds:['char','other']}];
- bindings['./character-storage'].loadCharacters=()=>[{id:'char',name:'角色'},{id:'other',name:'另一个角色'}];
+ assets=[{...asset,conversation:{kind:'group'}}];stored='{}'; values.clear();
+ modules['./chat-storage'].getChatSessionMetadata=()=>[{id:'s',isGroup:true,participantIds:['char','other']}];
+ bindings['./character-storage'].loadInteractableCharacters=()=>[{id:'char',name:'角色'},{id:'other',name:'另一个角色'}];
  bindings['./chat-engine'].sendLLMRequest=async()=>JSON.stringify({thought:'看到了照片',reply:'看到你画的了',delayMinutes:0});
  d.notifyAlbumAnnotationChange({...assets[0],albumAnnotations:[{id:'a',text:'群聊标记'}]});
  await engine.exports.reviewNextAlbumPhoto();
@@ -134,7 +134,7 @@ console.log('PASS: discussion persistence, delayed review, access boundaries and
  assert.ok(d.albumDiscussionMemory('other').some(c=>c.content.includes('群聊标记')));
  assert.equal(d.albumDiscussionMemory('stranger').length,0);
  console.log('PASS: group annotation notifications, replies and participant-scoped memory');
- stored='{}';coreData.clear();
+ stored='{}'; values.clear();coreData.clear();
  const uploaded={...asset,id:'album:upload',source:{kind:'album',assetVersionId:'upload'},uploadAlbum:'灵感'};
  assets=[uploaded];
  const beforeNative=calls;

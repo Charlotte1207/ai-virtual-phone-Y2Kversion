@@ -1,6 +1,6 @@
 import type { Character, CharacterAvatarHistoryEntry } from "./character-types";
 import type { ChatSession } from "./chat-storage";
-import { loadChatSessions } from "./chat-storage";
+import { getChatSessionMetadata } from "./chat-storage";
 import { kvGet, kvSet } from "./kv-db";
 
 export const CHAT_SESSION_AVATARS_UPDATED_EVENT = "chat-session-avatars-updated";
@@ -32,7 +32,7 @@ function appRecord(characterId: string): AvatarRecord | undefined {
     if (saved) return saved;
     // Upgrade legacy per-session avatars deterministically, using the latest
     // actual avatar selection (not the session's last chat-message timestamp).
-    const candidates = loadChatSessions().filter(s => Object.prototype.hasOwnProperty.call(s.characterAvatars || {}, characterId));
+    const candidates = getChatSessionMetadata().filter(s => Object.prototype.hasOwnProperty.call(s.characterAvatars || {}, characterId));
     const selectedAt = (s: ChatSession) => Math.max(0, ...(s.characterAvatarHistories?.[characterId] || [])
         .filter(entry => entry.avatar === s.characterAvatars?.[characterId])
         .map(entry => Date.parse(entry.lastSelectedAt) || 0));

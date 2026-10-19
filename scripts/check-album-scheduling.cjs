@@ -14,7 +14,7 @@ const modules = {
   './photo-album-discussion': {loadAlbumDiscussions: () => ({}), ALBUM_REVIEW_REQUESTED: 'review'},
   './photo-album-storage': {collectPhotoAlbumAssets: () => { scans++; return []; }, getPhotoAlbumSourceUpdatedEvents: () => ['source'], PHOTO_ALBUM_UPDATED_EVENT: 'album'},
   './photo-album-core': {reconcilePhotoAccess() {}},
-  './chat-storage': {loadChatSessions: () => [{id: 'chat'}]},
+  './chat-storage': {loadChatSessions: () => { throw new Error("Album must not scan every chat history"); }, getChatSessionMetadata: () => [{id: 'chat'}]},
   './kv-db': {kvGet: () => lock},
   './bg-timer': {bgSetInterval: fn => { tick = fn; return () => {}; }},
 };

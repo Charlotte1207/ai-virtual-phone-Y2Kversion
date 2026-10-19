@@ -1,6 +1,6 @@
 import { ALBUM_REVIEW_REQUESTED, queueAlbumReview, albumParticipants, albumPhotoContext, getAlbumDiscussion, loadAlbumDiscussions, saveAlbumDiscussion } from "./photo-album-discussion";
 import { collectPhotoAlbumAssets, resolvePhotoAlbumMedia, getPhotoAlbumSourceUpdatedEvents, PHOTO_ALBUM_UPDATED_EVENT } from "./photo-album-storage";
-import { loadChatSessions } from "./chat-storage";
+import { getChatSessionMetadata } from "./chat-storage";
 import { kvGet } from "./kv-db";
 import { loadInteractableCharacters as loadCharacters } from "./character-storage";
 import { loadApiConfigs, loadBindingConfig, loadPresets, loadRegexes, loadWorldBooks, resolveBinding, resolveUserIdentity } from "./settings-storage";
@@ -23,7 +23,7 @@ let quietUntil = 0;
 let activeAssetIds: Set<string> | undefined;
 let controller: AbortController | undefined;
 function chatHasPriority() {
-  return typeof document !== "undefined" && (document.hidden || Date.now() < quietUntil || loadChatSessions().some(s => {
+  return typeof document !== "undefined" && (document.hidden || Date.now() < quietUntil || getChatSessionMetadata().some(s => {
     try {
       const startedAt = Number(JSON.parse(kvGet(`chat-generating:${s.id}`) || "null")?.startedAt);
       return startedAt > 0 && Date.now() - startedAt < 5 * 60_000;

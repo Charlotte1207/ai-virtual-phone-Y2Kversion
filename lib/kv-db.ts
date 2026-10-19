@@ -20,6 +20,29 @@ if (typeof window !== "undefined") window.addEventListener("float-identity-silen
 // ── In-memory cache ──
 const _cache = new Map<string, string>();
 let _hydrated = false;
+const failedWrites = new Set<string>();
+let lastFailureNotice = 0;
+function writeFailed(key: string, value: string): void {
+    if (_cache.get(key) !== value) return;
+    failedWrites.add(key);
+    if (typeof window !== "undefined" && Date.now() - lastFailureNotice > 15_000) {
+        lastFailureNotice = Date.now();
+        window.dispatchEvent(new CustomEvent("global-notice", { detail: "部分数据尚未保存，请保持页面打开、检查设备存储空间；返回页面时会重试。" }));
+    }
+}
+export async function retryFailedKvWrites(): Promise<void> {
+    for (const key of [...failedWrites]) {
+        const value = _cache.get(key);
+        if (value === undefined) { failedWrites.delete(key); continue; }
+        await kvSetAsync(key, value);
+    }
+}
+if (typeof window !== "undefined") {
+    window.addEventListener("focus", () => { void retryFailedKvWrites().catch(() => undefined); });
+    window.addEventListener("beforeunload", event => {
+        if (failedWrites.size) { event.preventDefault(); event.returnValue = ""; }
+    });
+}
 
 // ── Migration registry ──
 const _fixedKeys: string[] = [];
@@ -44,11 +67,16 @@ function migrateLegacyKey(lsKey: string): void {
     if (typeof window === "undefined") return;
     const raw = identityLocalStorage.getItem(lsKey);
     if (raw === null) return;
-    if (_cache.get(lsKey) !== raw) {
-        _cache.set(lsKey, raw);
-        kvDb.entries.put({ key: physicalIdentityKey(lsKey), value: raw }).catch(() => {});
-    }
-    identityLocalStorage.removeItem(lsKey);
+    _cache.set(lsKey, raw);
+    // Cache equality is not proof of a committed write (a previous attempt may
+    // have failed). Keep the durable source until this exact value commits.
+    kvDb.entries.put({ key: physicalIdentityKey(lsKey), value: raw }).then(() => {
+        if (_cache.get(lsKey) === raw) failedWrites.delete(lsKey);
+        removeLegacyLocalStorageKeyIfValue(lsKey, raw);
+    }).catch(err => {
+        writeFailed(lsKey, raw);
+        console.warn("[KvDB] migration pending:", lsKey, err);
+    });
 }
 
 function migrateLegacyPrefix(prefix: string): void {
@@ -120,12 +148,24 @@ export function hydrateKvDb(): Promise<void> {
 }
 async function hydrateKvDbOnce(): Promise<void> {
     if (_hydrated || typeof window === "undefined") return;
+    const { resumeIdentityRecovery } = await import("./identity-recovery");
+    if (await resumeIdentityRecovery()) {
+        const { requestPhoneSessionRemount } = await import("./phone-session-protocol");
+        requestPhoneSessionRemount();
+        throw new Error("数据恢复已完成，请刷新进入");
+    }
     try {
-        // Load existing IDB data into cache
-        const all = await kvDb.entries.toArray();
-        for (const { key: physical, value } of all) {
-            const key = logicalIdentityKey(physical);
-            if (key !== null && !_cache.has(key)) _cache.set(key, value);
+        // Select keys before reading values: other identities may contain large
+        // inline media and must not be materialized just to discard them.
+        const keys = (await kvDb.entries.toCollection().primaryKeys())
+            .filter(key => logicalIdentityKey(key) !== null);
+        for (let offset = 0; offset < keys.length; offset += 32) {
+            const rows = await kvDb.entries.bulkGet(keys.slice(offset, offset + 32));
+            for (const row of rows) {
+                if (!row) continue;
+                const key = logicalIdentityKey(row.key);
+                if (key !== null && !_cache.has(key)) _cache.set(key, row.value);
+            }
         }
 
         // Migrate from localStorage
@@ -187,9 +227,11 @@ export function kvSet(key: string, value: string): void {
     _cache.set(key, value);
     if (isManagedLegacyKey(key)) writeFallbackLocalStorage(key, value);
     kvDb.entries.put({ key: physicalIdentityKey(key), value }).then(() => {
+        if (_cache.get(key) === value) failedWrites.delete(key);
         if (isManagedLegacyKey(key)) removeLegacyLocalStorageKeyIfValue(key, value);
     }).catch(err => {
-        writeFallbackLocalStorage(key, value);
+        if (_cache.get(key) === value) writeFallbackLocalStorage(key, value);
+        writeFailed(key, value);
         if (!isAbortLikeError(err)) {
             console.warn("[KvDB] put failed:", key, err);
         }
@@ -202,9 +244,11 @@ export async function kvSetAsync(key: string, value: string): Promise<void> {
     if (isManagedLegacyKey(key)) writeFallbackLocalStorage(key, value);
     try {
         await kvDb.entries.put({ key: physicalIdentityKey(key), value });
+        if (_cache.get(key) === value) failedWrites.delete(key);
         if (isManagedLegacyKey(key)) removeLegacyLocalStorageKeyIfValue(key, value);
     } catch (err) {
-        writeFallbackLocalStorage(key, value);
+        if (_cache.get(key) === value) writeFallbackLocalStorage(key, value);
+        writeFailed(key, value);
         if (!isAbortLikeError(err)) {
             console.warn("[KvDB] put failed:", key, err);
         }
@@ -216,6 +260,7 @@ export async function kvSetAsync(key: string, value: string): Promise<void> {
 export function kvRemove(key: string): void {
     if (!isSharedIdentityKey(key)) assertIdentityActive();
     _cache.delete(key);
+    failedWrites.delete(key);
     if (isManagedLegacyKey(key)) removeLegacyLocalStorageKey(key);
     kvDb.entries.delete(physicalIdentityKey(key)).catch(err =>
         console.warn("[KvDB] delete failed:", key, err));
@@ -232,4 +277,26 @@ export function kvKeysWithPrefix(prefix: string): string[] {
 
 export function kvEntries(): Array<{ key: string; value: string }> {
     return Array.from(_cache.entries()).map(([key, value]) => ({ key, value }));
+}
+
+/** Commit a legacy split and removal together; concurrent per-record edits win. */
+export async function migrateKvRecords(sourceKey: string, raw: string, records: Array<{ key: string; value: string }>): Promise<void> {
+    assertIdentityActive();
+    const source = physicalIdentityKey(sourceKey);
+    const added: typeof records = [];
+    await kvDb.transaction("rw", kvDb.entries, async () => {
+        if ((await kvDb.entries.get(source))?.value !== raw) return;
+        for (const record of records) {
+            const key = physicalIdentityKey(record.key);
+            if (await kvDb.entries.get(key)) continue;
+            await kvDb.entries.put({ key, value: record.value });
+            added.push(record);
+        }
+        await kvDb.entries.delete(source);
+    });
+    for (const record of added) if (!_cache.has(record.key)) _cache.set(record.key, record.value);
+    if (_cache.get(sourceKey) === raw && !(await kvDb.entries.get(source))) {
+        _cache.delete(sourceKey);
+        removeLegacyLocalStorageKeyIfValue(sourceKey, raw);
+    }
 }

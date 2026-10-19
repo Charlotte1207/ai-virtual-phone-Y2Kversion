@@ -92,8 +92,7 @@ function generateId(): string {
     return `mc_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
-export async function storeMediaBlob(blob: Blob, mimeType: string, category: MediaCacheEntry["mediaCategory"]): Promise<string> {
-    const id = generateId();
+export async function storeMediaBlob(blob: Blob, mimeType: string, category: MediaCacheEntry["mediaCategory"], id = generateId()): Promise<string> {
     await getDb().entries.put({ id, blob, mimeType, mediaCategory: category, createdAt: Date.now() });
     return `${MEDIA_STORE_PROTOCOL}${id}`;
 }

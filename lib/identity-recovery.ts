@@ -1,15 +1,21 @@
 /** Local pre-migration snapshots; never exported or sent to a server automatically. */
-import Dexie, { type Table } from "dexie";
+import Dexie, { type Table, type IndexableTypeArrayReadonly } from "dexie";
+import { withBackupOperation } from "./data-management/operation-lock";
 import { createIdentityId } from "./identity-space";
 import { IDENTITY_RUNTIME_KEY, isSharedIdentityKey, identityDatabaseIsShared, silenceIdentityRuntime } from "./identity-runtime";
-type RecoveryMeta = { id: string; createdAt: string; complete: boolean; local: Array<[string, string]>; databases: Array<{ name: string; version: number; stores: Array<{ name: string; keyPath: string | string[] | null; autoIncrement: boolean; indexes: Array<{ name: string; keyPath: string | string[]; unique: boolean; multiEntry: boolean }> }> }> };
+type RecoveryMeta = { id: string; createdAt: string; complete: boolean; local: Array<[string, string]>; databases: Array<{ name: string; version: number; stores: Array<{ name: string; chunkCount?: number; keyPath: string | string[] | null; autoIncrement: boolean; indexes: Array<{ name: string; keyPath: string | string[]; unique: boolean; multiEntry: boolean }> }> }> };
 type RecoveryChunk = { id: string; recoveryId: string; database: string; store: string; rows: unknown[]; keys: IDBValidKey[] };
 class RecoveryDb extends Dexie {
   points!: Table<RecoveryMeta, string>;
   chunks!: Table<RecoveryChunk, string>;
-  constructor() { super("AiPhoneIdentityRecoveryDB"); this.version(1).stores({ points: "id, createdAt", chunks: "id, recoveryId" }); }
+  operations!: Table<{ id: string; data: unknown }, string>;
+  constructor() { super("AiPhoneIdentityRecoveryDB"); this.version(1).stores({ points: "id, createdAt", chunks: "id, recoveryId" });
+    this.version(2).stores({ points: "id, createdAt", chunks: "id, recoveryId, [recoveryId+database+store]", operations: "id" }); }
 }
 const recovery = new RecoveryDb();
+export async function readIdentityOperation<T>(id: string): Promise<T | undefined> { return (await recovery.operations.get(id))?.data as T | undefined; }
+export async function saveIdentityOperation(id: string, data: unknown): Promise<void> { await recovery.operations.put({ id, data }); }
+export async function removeIdentityOperation(id: string): Promise<void> { await recovery.operations.delete(id); }
 /** Deletion also removes the deleted world's private copies from local recovery points. */
 export async function purgeIdentityRecoveryData(userId: string, legacyOwnerId: string | null, removedAssetIds: string[]): Promise<void> {
   const prefix = `identity:${encodeURIComponent(userId)}:`;
@@ -29,7 +35,8 @@ export async function purgeIdentityRecoveryData(userId: string, legacyOwnerId: s
         return [key, value];
       });
       await recovery.points.put(point);
-      for (const chunk of await recovery.chunks.where("recoveryId").equals(point.id).toArray()) {
+      for (const chunkId of await recovery.chunks.where("recoveryId").equals(point.id).primaryKeys()) {
+        const chunk = (await recovery.chunks.get(chunkId))!;
         if (ownsDb(chunk.database)) { await recovery.chunks.delete(chunk.id); continue; }
         const keep = (row: any) => {
           if (chunk.database === "AiPhoneKvDB") return !ownsKey(row.key);
@@ -81,6 +88,7 @@ export async function createIdentityRecoveryPoint(): Promise<string> {
             await recovery.chunks.put({ id: JSON.stringify([id, db.name, name, chunk++]), recoveryId: id, database: db.name, store: name, rows, keys });
             lastKey = keys[keys.length - 1];
           }
+          definition.stores[definition.stores.length - 1].chunkCount = chunk;
         }
         meta.databases.push(definition);
       } finally { db.close(); }
@@ -95,42 +103,88 @@ export async function listIdentityRecoveryPoints(): Promise<Array<{ id: string; 
   return (await recovery.points.toArray()).filter(point => point.complete).map(({ id, createdAt }) => ({ id, createdAt }));
 }
 
-/** Explicit recovery action only, never part of normal app initialization. */
+type RestoreProgress = { recoveryId: string; completed: string[] };
+
+/** Each database commits atomically; the durable journal resumes across databases. */
 export async function restoreIdentityRecoveryPoint(id: string): Promise<void> {
+  return withBackupOperation(() => restorePoint(id));
+}
+async function restorePoint(id: string): Promise<void> {
   const point = await recovery.points.get(id);
   if (!point?.complete) throw new Error("身份恢复点不存在或不完整");
-  silenceIdentityRuntime();
-  for (const database of await indexedDB.databases()) {
-    if (!database.name || database.name === "AiPhoneIdentityRecoveryDB") continue;
-    await new Promise<void>((resolve, reject) => {
-      const request = indexedDB.deleteDatabase(database.name!);
-      request.onsuccess = () => resolve(); request.onerror = () => reject(request.error);
-      request.onblocked = () => reject(new Error("请先关闭其他 Float 页面，再恢复数据"));
-    });
+  const pending = await readIdentityOperation<RestoreProgress>("restore");
+  if (pending && pending.recoveryId !== id) throw new Error("请先完成上一次恢复");
+  // Validate all chunks before changing any live data. Read one chunk at a time.
+  const groups = new Map<string, string[]>();
+  for (const definition of point.databases) for (const info of definition.stores) {
+    const ids = await recovery.chunks.where("[recoveryId+database+store]").equals([id, definition.name, info.name]).primaryKeys();
+    if (info.chunkCount !== undefined && ids.length !== info.chunkCount) throw new Error("恢复点缺少分块，未开始恢复");
+    for (const chunkId of ids) {
+      const chunk = await recovery.chunks.get(chunkId);
+      if (!chunk || chunk.rows.length !== chunk.keys.length) throw new Error("恢复点分块不完整，未开始恢复");
+    }
+    groups.set(JSON.stringify([definition.name, info.name]), ids);
   }
+  const progress = pending || { recoveryId: id, completed: [] };
+  await saveIdentityOperation("restore", progress);
+  silenceIdentityRuntime();
   for (const definition of point.databases) {
-    const request = indexedDB.open(definition.name, definition.version);
+    if (progress.completed.includes(definition.name)) continue;
+    const existing = (await indexedDB.databases()).find(db => db.name === definition.name);
+    const request = indexedDB.open(definition.name, existing?.version || definition.version);
     request.onupgradeneeded = () => {
       for (const info of definition.stores) {
-        if (request.result.objectStoreNames.contains(info.name)) continue;
         const store = request.result.createObjectStore(info.name, { keyPath: info.keyPath, autoIncrement: info.autoIncrement });
         for (const index of info.indexes) store.createIndex(index.name, index.keyPath, { unique: index.unique, multiEntry: index.multiEntry });
       }
     };
-    const db = await req(request);
+    request.onblocked = () => { /* No data has been deleted; closing the other tab allows progress. */ };
+    const native = await req(request);
     try {
       for (const info of definition.stores) {
-        const chunks = (await recovery.chunks.where("recoveryId").equals(id).toArray()).filter(chunk => chunk.database === db.name && chunk.store === info.name);
-        const tx = db.transaction(info.name, "readwrite");
-        const done = new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error); });
-        const store = tx.objectStore(info.name); store.clear();
-        for (const chunk of chunks) for (let i = 0; i < chunk.rows.length; i++) {
-          if (info.keyPath === null) store.put(chunk.rows[i], chunk.keys[i]); else store.put(chunk.rows[i]);
+        if (!native.objectStoreNames.contains(info.name) || JSON.stringify(native.transaction(info.name).objectStore(info.name).keyPath) !== JSON.stringify(info.keyPath)) {
+          throw new Error("数据库结构与恢复点不一致，已保留现有数据，请使用文件备份导入");
         }
-        await done;
       }
-    } finally { db.close(); }
+    } finally { native.close(); }
+    const target = new Dexie(definition.name);
+    try {
+      await target.open();
+      if (target.tables.length) await target.transaction("rw", target.tables, async () => {
+        for (const table of target.tables) await table.clear();
+        for (const info of definition.stores) {
+          for (const chunkId of groups.get(JSON.stringify([definition.name, info.name])) || []) {
+            // Hold the target transaction while reading a single external chunk.
+            const chunk = await Dexie.waitFor(Dexie.ignoreTransaction(() => recovery.chunks.get(chunkId)));
+            if (!chunk) throw new Error("恢复分块已丢失");
+            if (info.keyPath === null) await target.table(info.name).bulkPut(chunk.rows, chunk.keys as IndexableTypeArrayReadonly);
+            else await target.table(info.name).bulkPut(chunk.rows);
+          }
+        }
+      });
+    } finally { target.close(); }
+    progress.completed.push(definition.name);
+    await saveIdentityOperation("restore", progress);
   }
-  window.localStorage.clear();
+  // Only after all snapshot databases committed may obsolete databases be removed.
+  for (const db of await indexedDB.databases()) {
+    if (!db.name || db.name === "AiPhoneIdentityRecoveryDB" || point.databases.some(d => d.name === db.name)) continue;
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.deleteDatabase(db.name!);
+      request.onsuccess = () => resolve(); request.onerror = () => reject(request.error);
+      request.onblocked = () => reject(new Error("其他页面占用数据库，关闭后刷新可继续恢复"));
+    });
+  }
+  // Do not clear the whole storage first: a quota failure leaves the journal for retry.
+  const keys = new Set(point.local.map(([key]) => key));
   for (const [key, value] of point.local) window.localStorage.setItem(key, value);
+  for (const key of Object.keys(window.localStorage)) if (!keys.has(key)) window.localStorage.removeItem(key);
+  await removeIdentityOperation("restore");
+}
+
+export async function resumeIdentityRecovery(): Promise<boolean> {
+  const pending = await readIdentityOperation<RestoreProgress>("restore");
+  if (!pending) return false;
+  await restoreIdentityRecoveryPoint(pending.recoveryId);
+  return true;
 }

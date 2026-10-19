@@ -1046,12 +1046,24 @@ export function saveChatSendConfig(config: ChatSendConfig): void {
 
 // --- User Identities ──────────────────────────────────────────
 
+let userIdentitiesRaw: string | null | undefined;
+let userIdentitiesCache: UserIdentity[] = [];
+
 export function loadUserIdentities(): UserIdentity[] {
     if (typeof window === "undefined") return [];
     try {
         const raw = kvGet(USER_IDENTITIES_KEY);
-        if (!raw) return [];
-        return JSON.parse(raw) as UserIdentity[];
+        if (raw !== userIdentitiesRaw) {
+            userIdentitiesRaw = raw;
+            userIdentitiesCache = [];
+            const parsed: unknown = raw ? JSON.parse(raw) : [];
+            if (Array.isArray(parsed)) userIdentitiesCache = parsed;
+        }
+        // Keep callers' editable copies independent without reparsing embedded avatars.
+        return userIdentitiesCache.map(identity => ({
+            ...identity,
+            ...(identity.previousNames ? { previousNames: [...identity.previousNames] } : {}),
+        }));
     } catch {
         return [];
     }

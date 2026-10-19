@@ -8,7 +8,7 @@ const mods={
  './photo-album-discussion':{albumParticipants:()=>allowed?['char']:[],getAlbumDiscussion:()=>({comments:[]}),saveAlbumDiscussion:t=>messages.push(t)},
  './photo-album-permissions':{getAlbumPermission:()=>({revision})},
  './chat-storage':{loadChatSessions:()=>[{id:'private',contactId:'char'}],pushChatMessage:m=>messages.push(m)},
- './character-storage':{loadCharacters:()=>[{id:'char',name:'角色'}]},
+ './character-storage':{loadInteractableCharacters:()=>[{id:'char',name:'角色'}]},
  './media-cache-storage':{storeMediaBlob:async()=>`media-store://copy`,deleteMediaRef:async ref=>deleted.push(ref)},
  './chat-photo-markup':{compositePhotoAnnotations:async()=> 'data:image/jpeg;base64,doodle'},
  './chat-avatar-action':{setAvatarFromSharedAlbum:()=>{avatars++;return true}},

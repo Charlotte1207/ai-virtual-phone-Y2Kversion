@@ -4,7 +4,7 @@ import { identityLocalStorage } from "@/lib/identity-runtime";
 
 
 import { chatDb } from "./chat-db";
-import { collectPhotoAlbumAssets } from "./photo-album-storage";
+import { collectPhotoAlbumAssets, isFavoriteChatPhoto, type PhotoAlbumAsset } from "./photo-album-storage";
 import { relocatePhotoMedia } from "./photo-album-core";
 import { getAlbumDiscussion, saveAlbumDiscussion } from "./photo-album-discussion";
 import { updateChatMessage, loadChatMessages, type ChatMessage } from "./chat-storage";
@@ -225,8 +225,7 @@ async function persistChatMediaPatch(
   await chatDb.messages.put(cached ?? nextMessage);
 }
 
-async function compactChatImage(message: ChatMessage, nowIso: string): Promise<{ changed: boolean; freedBytes: number }> {
-  const albumAsset = collectPhotoAlbumAssets({ includeExcluded: true }).find(a => a.source.kind === "chat" && a.source.messageId === message.id);
+async function compactChatImage(message: ChatMessage, nowIso: string, albumAsset?: PhotoAlbumAsset): Promise<{ changed: boolean; freedBytes: number }> {
   const mediaUrl = message.mediaUrl;
   const mediaRef = message.mediaData?.imageGenerationMediaRef;
   let sourceBlob: Blob | null = null;
@@ -271,7 +270,7 @@ async function compactChatImage(message: ChatMessage, nowIso: string): Promise<{
   const nextMime = nextBlob.type || sourceMime;
   const nextRef = compressed || !sourceRef ? await storeMediaBlob(nextBlob, nextMime, "image") : sourceRef;
   const latest = loadChatMessages(message.sessionId).find(m => m.id === message.id);
-  if (!latest || latest.isRetracted || latest.mediaUrl !== message.mediaUrl || latest.mediaData?.imageGenerationMediaRef !== message.mediaData?.imageGenerationMediaRef) {
+  if (!latest || latest.isRetracted || isAlbumFavoriteMessage(latest) || latest.mediaUrl !== message.mediaUrl || latest.mediaData?.imageGenerationMediaRef !== message.mediaData?.imageGenerationMediaRef) {
     if (nextRef !== sourceRef) await deleteMediaRef(nextRef).catch(() => undefined);
     return { changed: false, freedBytes: 0 };
   }
@@ -317,16 +316,14 @@ async function compactChatXiaohongshuShareImage(message: ChatMessage, nowIso: st
   return compressed;
 }
 
-function isAlbumFavoriteMessage(messageId: string): boolean {
-  return collectPhotoAlbumAssets({ includeExcluded: true }).some(a => a.favorite && a.source.kind === "chat" && a.source.messageId === messageId);
+function isAlbumFavoriteMessage(message: ChatMessage): boolean {
+  return isFavoriteChatPhoto(message.sessionId, message.id);
 }
 
 export async function cleanChatImage(message: ChatMessage, nowIso: string): Promise<number> {
-  if (isAlbumFavoriteMessage(message.id)) return 0;
+  if (isAlbumFavoriteMessage(message)) return 0;
   const seen = new Set<string>();
   let freedBytes = 0;
-  freedBytes += await deleteMediaRefWithSize(message.mediaUrl, seen);
-  freedBytes += await deleteMediaRefWithSize(message.mediaData?.imageGenerationMediaRef, seen);
   const nextMediaData: ChatMessage["mediaData"] = {
     ...message.mediaData,
     mediaCleanedAt: nowIso,
@@ -337,11 +334,22 @@ export async function cleanChatImage(message: ChatMessage, nowIso: string): Prom
     mediaUrl: undefined,
     mediaData: nextMediaData,
   };
-  const cached = updateChatMessage(message.id, {
+  const committed = await chatDb.transaction("rw", chatDb.messages, async () => {
+    const latest = await chatDb.messages.get(message.id);
+    if (!latest || latest.isRetracted || isAlbumFavoriteMessage(latest)
+      || latest.mediaUrl !== message.mediaUrl || latest.mediaData?.imageGenerationMediaRef !== message.mediaData?.imageGenerationMediaRef) return false;
+    nextMessage.mediaData = { ...latest.mediaData, mediaCleanedAt: nowIso };
+    delete nextMessage.mediaData.imageGenerationMediaRef;
+    await chatDb.messages.put({ ...latest, mediaUrl: undefined, mediaData: nextMessage.mediaData });
+    return true;
+  });
+  if (!committed) return 0;
+  updateChatMessage(message.id, {
     mediaUrl: undefined,
     mediaData: nextMessage.mediaData,
   });
-  await chatDb.messages.put(cached ?? nextMessage);
+  freedBytes += await deleteMediaRefWithSize(message.mediaUrl, seen);
+  freedBytes += await deleteMediaRefWithSize(message.mediaData?.imageGenerationMediaRef, seen);
   return freedBytes + estimateValueBytes(message.mediaUrl);
 }
 
@@ -357,27 +365,35 @@ export async function cleanChatXiaohongshuShareImage(message: ChatMessage, nowIs
 }
 
 async function runChatImageMaintenance(result: MediaMaintenanceResult, nowMs: number, nowIso: string): Promise<void> {
-  const messages = await chatDb.messages.toArray().catch(() => []);
-  for (const message of messages) {
-    if (isAlbumFavoriteMessage(message.id)) continue;
-    const isRegularImage = isChatImageMessage(message);
-    const isXiaohongshuShareImage = isChatXiaohongshuShareImage(message);
-    if (!isRegularImage && !isXiaohongshuShareImage) continue;
-    if (isRegularImage && !message.mediaUrl && !message.mediaData?.imageGenerationMediaRef) continue;
-    if (isOlderThan(message.createdAt, CLEAN_AFTER_MS, nowMs)) {
-      result.freedBytes += isXiaohongshuShareImage
-        ? await cleanChatXiaohongshuShareImage(message, nowIso).catch(() => 0)
-        : await cleanChatImage(message, nowIso).catch(() => 0);
-      result.chatImagesCleaned += 1;
-      continue;
+  let albumByMessage: Map<string, PhotoAlbumAsset> | undefined;
+  let lastId: string | undefined;
+  while (true) {
+    const messages: ChatMessage[] = await (lastId === undefined ? chatDb.messages.orderBy(":id") : chatDb.messages.where(":id").above(lastId)).limit(32).toArray();
+    if (!messages.length) break;
+    lastId = messages[messages.length - 1].id;
+    for (const message of messages) {
+      const isRegularImage = isChatImageMessage(message);
+      const isXiaohongshuShareImage = isChatXiaohongshuShareImage(message);
+      if (!isRegularImage && !isXiaohongshuShareImage) continue;
+      if (isAlbumFavoriteMessage(message)) continue;
+      if (isRegularImage && !message.mediaUrl && !message.mediaData?.imageGenerationMediaRef) continue;
+      if (isOlderThan(message.createdAt, CLEAN_AFTER_MS, nowMs)) {
+        result.freedBytes += isXiaohongshuShareImage
+          ? await cleanChatXiaohongshuShareImage(message, nowIso).catch(() => 0)
+          : await cleanChatImage(message, nowIso).catch(() => 0);
+        result.chatImagesCleaned += 1;
+        continue;
+      }
+      if (!message.mediaData?.mediaCompressedAt && isOlderThan(message.createdAt, COMPRESS_AFTER_MS, nowMs)) {
+        if (isRegularImage && !albumByMessage) albumByMessage = new Map(collectPhotoAlbumAssets({ includeExcluded: true }).flatMap(asset => asset.source.kind === "chat" ? [[asset.source.messageId, asset] as const] : []));
+        const compacted = isXiaohongshuShareImage
+          ? await compactChatXiaohongshuShareImage(message, nowIso).catch(() => ({ changed: false, freedBytes: 0 }))
+          : await compactChatImage(message, nowIso, albumByMessage?.get(message.id)).catch(() => ({ changed: false, freedBytes: 0 }));
+        result.freedBytes += compacted.freedBytes;
+        if (compacted.changed) result.chatImagesCompressed += 1;
+      }
     }
-    if (!message.mediaData?.mediaCompressedAt && isOlderThan(message.createdAt, COMPRESS_AFTER_MS, nowMs)) {
-      const compacted = isXiaohongshuShareImage
-        ? await compactChatXiaohongshuShareImage(message, nowIso).catch(() => ({ changed: false, freedBytes: 0 }))
-        : await compactChatImage(message, nowIso).catch(() => ({ changed: false, freedBytes: 0 }));
-      result.freedBytes += compacted.freedBytes;
-      if (compacted.changed) result.chatImagesCompressed += 1;
-    }
+    await new Promise(resolve => setTimeout(resolve, 0));
   }
 }
 

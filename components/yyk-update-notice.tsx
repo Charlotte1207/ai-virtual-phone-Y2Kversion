@@ -25,14 +25,14 @@ export function YykUpdateCard({ notice, onClose, preview = false }: { notice: Up
     }}>
         <section ref={panel} className={styles.card} role="dialog" aria-modal="true" aria-labelledby="yyk-update-title" aria-describedby="yyk-update-description">
             <button className={styles.close} aria-label="关闭更新卡片" onClick={() => onClose(false)}><X size={18} /></button>
-            <div className={styles.sender}><span className={styles.mark}><Smartphone size={23} /></span><div><strong>float-Yyk</strong><div className={styles.meta}>{preview ? "预览 · " : installed ? "已更新 · " : `v${YYK_VERSION} → `}v{notice.version} · {notice.date}</div></div></div>
-            <h2 id="yyk-update-title">Float-二改项目-Yyk版本</h2>
-            <p id="yyk-update-description" className={styles.intro}>本次更新内容如下。<br />{installed ? "你正在使用此版本。" : "如有需要，可同步仓库并重新部署。"}</p>
+            <div className={styles.sender}><span className={styles.mark}><Smartphone size={23} /></span><div className={styles.meta}>{preview ? "预览 · " : ""}{notice.date}</div></div>
+            <h2 id="yyk-update-title">更新版本 {notice.version}</h2>
             <ul className={styles.changes}>{notice.changes.map((item, i) => <li key={i}><Check size={19} /><div><strong>{item.title}</strong><p>{item.text}</p></div></li>)}</ul>
+            <p id="yyk-update-description" className={styles.intro}>如果需要的话，请拉取更新。</p>
             <div className={styles.actions}><button className={styles.primary} aria-expanded={guide} aria-controls="yyk-update-guide" onClick={() => setGuide(!guide)}>{guide ? "收起更新方法" : "查看拉取方法"}</button><button onClick={() => onClose(false)}>{installed ? "知道了" : "稍后再说"}</button></div>
             {guide && <div id="yyk-update-guide" className={styles.guide}><strong>在你自己的仓库里更新</strong><ol><li>先在小手机里导出重要数据备份。</li><li>打开你的 GitHub fork，选择 Sync fork → Update branch；如有冲突，先确认自己的改动。</li><li>等托管平台重新部署完成；未开启自动部署时，需手动触发部署。再打开原网址。</li></ol><a href={YYK_REPOSITORY} target="_blank" rel="noopener noreferrer">查看公开仓库</a></div>}
             {!installed && <button className={styles.dismiss} onClick={() => onClose(true)}>本次不再提醒</button>}
-            <p className={styles.credit}>本次更新人员：Yyk / Yyk的机</p>
+            <p className={styles.credit}>更新人：Yyk的机</p>
         </section>
     </div>;
 }

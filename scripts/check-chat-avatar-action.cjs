@@ -7,7 +7,7 @@ const avatar={
  CHAT_SESSION_AVATARS_UPDATED_EVENT:'chat-session-avatars-updated',
 };
 let owner='A';const stores=new Map();
-const shared={exports:{},require:id=>id==='./kv-db'?{kvGet:key=>stores.get(owner+key),kvSet:(key,value)=>stores.set(owner+key,value)}:id==='./chat-storage'?{loadChatSessions:()=>sessions}:{}};
+const shared={exports:{},require:id=>id==='./kv-db'?{kvGet:key=>stores.get(owner+key),kvSet:(key,value)=>stores.set(owner+key,value)}:id==='./chat-storage'?{getChatSessionMetadata:()=>sessions,loadChatSessions:()=>{throw new Error('Avatar reads must not refresh message previews');}}:{}};
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('lib/chat-session-avatar.ts','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText,shared);
 Object.assign(avatar,shared.exports);
 const sandbox={exports:{},Date,Map,Set,require:id=>id==='./chat-storage'?{

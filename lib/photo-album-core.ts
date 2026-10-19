@@ -22,7 +22,7 @@ function write(s: Core) { kvSet(KEY, JSON.stringify(s)); }
 const now = () => new Date().toISOString();
 const versionId = () => `pv-${Date.now()}-${Math.random().toString(36).slice(2,10)}`;
 const refKeys = new Map<string, { ref: string; key: string }>();
-function refKey(ref?: string, assetId?: string): string | undefined {
+export function refKey(ref?: string, assetId?: string): string | undefined {
   if (!ref?.startsWith("data:")) return ref;
   const cached = assetId ? refKeys.get(assetId) : undefined; if (cached?.ref === ref) return cached.key;
   let a = 2166136261, b = 5381;
@@ -31,7 +31,7 @@ function refKey(ref?: string, assetId?: string): string | undefined {
   if (assetId) refKeys.set(assetId, { ref, key }); return key;
 }
 export const photoIdOf = (asset: PhotoAlbumAsset) => asset.canonicalPhotoId || asset.id;
-export const contentVersionOf = (asset: PhotoAlbumAsset) => asset.contentVersion || asset.mediaRef || asset.label;
+export const contentVersionOf = (asset: PhotoAlbumAsset) => asset.contentVersion || refKey(asset.mediaRef, asset.id) || asset.label;
 export const variantVersionOf = (asset: PhotoAlbumAsset) => asset.variantVersion || JSON.stringify([...asset.baseAnnotations, ...asset.albumAnnotations]);
 
 /** Source presentation IDs never change. Physical relocation must use relocatePhotoMedia. */

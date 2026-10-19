@@ -6,6 +6,8 @@ const assert = require('node:assert/strict');
 const { chromium } = require('playwright');
 const files = ['identity-space', 'identity-runtime', 'phone-session-protocol', 'identity-db-guard', 'identity-recovery', 'identity-media-cleanup', 'identity-lifecycle', 'identity-access', 'kv-db'];
 const sources = Object.fromEntries(files.map(name => [name, ts.transpileModule(fs.readFileSync(`lib/${name}.ts`, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText]));
+sources['operation-lock'] = ts.transpileModule(fs.readFileSync('lib/data-management/operation-lock.ts','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
+sources['identity-backup'] = ts.transpileModule(fs.readFileSync('lib/data-management/identity-backup.ts','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
 sources.idb = ts.transpileModule(fs.readFileSync('lib/data-management/idb.ts','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
 async function main() {
  const server = http.createServer((_req, res) => res.end('<!doctype html><title>Production identity regression</title>'));
@@ -50,6 +52,8 @@ async function main() {
    await module('kv-db').hydrateKvDb();
    check(module('identity-runtime').getCurrentIdentityId() === 'A', 'Wrong legacy owner');
    check(module('identity-runtime').hasActiveIdentity(), 'Initialization left dispatcher paused');
+   check((await module('identity-recovery').listIdentityRecoveryPoints()).length === 0, 'Initialization must not duplicate the whole save');
+   await module('identity-recovery').createIdentityRecoveryPoint();
    const nativeUuid = crypto.randomUUID; Object.defineProperty(crypto,'randomUUID',{value:undefined,configurable:true});
    check(/^[a-f0-9-]{36}$/.test(module('identity-space').createIdentityId()),'LAN UUID fallback failed');
    Object.defineProperty(crypto,'randomUUID',{value:nativeUuid,configurable:true});
@@ -107,6 +111,16 @@ async function main() {
   });
   await page.evaluate(async()=>{
    let remounts=0;const host=event=>{event.preventDefault();remounts++};window.addEventListener('float-phone-session-remount',host);
+   const occupied = await new Promise((resolve,reject)=>{const r=indexedDB.open('AiPhoneChatDB');r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)});
+   occupied.onversionchange=()=>{};
+   let blocked=false;try{await module('identity-lifecycle').deletePhoneIdentity('A')}catch{blocked=true}
+   check(blocked, 'Occupied database must leave a retryable deletion');
+   const retained=new Dexie('ai_phone_theme_db_v1');await retained.open();
+   check(await retained.table('assets').get('A-image'), 'Blocked deletion prematurely removed media');retained.close();
+   check(await module('identity-recovery').readIdentityOperation('delete:A'), 'Deletion progress was not persisted');
+   const recoveryDb=new Dexie('AiPhoneIdentityRecoveryDB');await recoveryDb.open();
+   check((await recoveryDb.table('chunks').toArray()).some(c=>c.database==='AiPhoneChatDB'), 'Blocked deletion prematurely purged recovery');recoveryDb.close();
+   occupied.close();
    await module('identity-lifecycle').deletePhoneIdentity('A');
    check(remounts===1&&module('identity-runtime').readIdentityRuntime().activeUserId==='B','Deletion did not request an internal remount after selecting B');
    check(window.testController.signal.aborted,'Delete did not cancel old requests');
@@ -148,6 +162,13 @@ async function main() {
   assert.equal(result, true);
   await page.evaluate(async()=>{
    const points=await module('identity-recovery').listIdentityRecoveryPoints();
+   const live=new Dexie('AiPhoneKvDB');await live.open();await live.table('entries').put({key:'rollback-sentinel',value:'keep-on-failure'});live.close();
+   const nativePut=IDBObjectStore.prototype.put;
+   IDBObjectStore.prototype.put=function(value,...args){if(this.transaction.db.name==='AiPhoneKvDB'&&value.key==='ai_phone_characters_v1')throw new DOMException('Injected quota','QuotaExceededError');return nativePut.call(this,value,...args)};
+   let failed=false;try{await module('identity-recovery').restoreIdentityRecoveryPoint(points[0].id)}catch{failed=true}finally{IDBObjectStore.prototype.put=nativePut}
+   check(failed,'Restore fault was not exercised');
+   const rollback=new Dexie('AiPhoneKvDB');await rollback.open();check(await rollback.table('entries').get('rollback-sentinel'),'Failed database restore destroyed live rows');rollback.close();
+   check(await module('identity-recovery').readIdentityOperation('restore'),'Interrupted restore lost progress');
    await module('identity-recovery').restoreIdentityRecoveryPoint(points[0].id);
    const db=new Dexie('AiPhoneKvDB');db.version(1).stores({entries:'key'});
    const rows=await db.table('entries').toArray();

@@ -65,10 +65,10 @@ const album = loadTypeScriptModule("lib/photo-album-storage.ts", {
     CHAT_MESSAGES_DELETED_EVENT: "chat-messages-deleted",
     CHAT_MESSAGE_PUSHED_EVENT: "chat-message-pushed",
     CHAT_RESPONSE_BATCH_REPLACED_EVENT: "chat-response-batch-replaced",
-    loadChatSessions: () => sessions,
+    loadChatSessions: () => { throw new Error("Album must not scan every chat history"); }, getChatSessionMetadata: () => sessions,
     loadChatMessages: sessionId => messages[sessionId] || [],
   },
-  "./character-storage": { loadCharacters: () => characters },
+  "./character-storage": { loadInteractableCharacters: () => characters },
   "./photo-album-core": core,
   "./media-cache-storage": {
     deleteMediaRef: async ref => { deletedMediaRefs.push(ref); },

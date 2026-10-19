@@ -5,7 +5,7 @@ import {
   CHAT_MESSAGE_PUSHED_EVENT,
   CHAT_RESPONSE_BATCH_REPLACED_EVENT,
   loadChatMessages,
-  loadChatSessions,
+  getChatSessionMetadata,
   type ChatMessage,
   type ChatPhotoAnnotation,
   type ChatSession,
@@ -17,6 +17,18 @@ import { deleteThemeAsset } from "./theme-storage";
 import { attachPhotoVersions, relocatePhotoMedia } from "./photo-album-core";
 
 const PHOTO_ALBUM_STORAGE_KEY = "ai_phone_photo_album_v1";
+let favoriteRaw: string | null | undefined;
+let favoriteIds = new Set<string>();
+/** Metadata only: never walk chat histories to protect a favorite. */
+export function isFavoriteChatPhoto(sessionId: string, messageId: string): boolean {
+  const raw = kvGet(PHOTO_ALBUM_STORAGE_KEY);
+  if (raw !== favoriteRaw) {
+    try { favoriteIds = new Set(JSON.parse(raw || "{}").favorites || []); }
+    catch { return true; } // Corrupt metadata must not authorize media deletion.
+    favoriteRaw = raw;
+  }
+  return favoriteIds.has(`chat:${sessionId}:${messageId}`);
+}
 export const PHOTO_ALBUM_UPDATED_EVENT = "photo-album-updated";
 export const getPhotoAlbumSourceUpdatedEvents = () => [
   CHAT_MESSAGE_PUSHED_EVENT,
@@ -298,7 +310,7 @@ export function collectPhotoAlbumAssets(options?: { includeExcluded?: boolean })
   const state = loadPhotoAlbumState();
   const favorites = new Set(state.favorites);
   const exclusions = new Set(state.exclusions);
-  const chatAssets = loadChatSessions().flatMap((session) => {
+  const chatAssets = getChatSessionMetadata().flatMap((session) => {
     const conversation = conversationForSession(session);
     return loadChatMessages(session.id)
       .filter(isAlbumPhotoMessage)

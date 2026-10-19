@@ -5,9 +5,10 @@ import {
   isSharedIdentityKey, identityDatabaseIsShared, IDENTITY_ACCESS_KEY, IDENTITY_BASE_BINDING_KEY,
   pauseIdentityDispatch,
 } from "./identity-runtime";
-import { createIdentityRecoveryPoint, listIdentityRecoveryPoints, purgeIdentityRecoveryData } from "./identity-recovery";
-import { deleteIdentityMedia } from "./identity-media-cleanup";
+import { purgeIdentityRecoveryData, readIdentityOperation, saveIdentityOperation, removeIdentityOperation } from "./identity-recovery";
+import { planIdentityMediaDeletion, removeIdentityMediaIds } from "./identity-media-cleanup";
 import { requestPhoneSessionRemount } from "./phone-session-protocol";
+import { withBackupOperation } from "./data-management/operation-lock";
 
 let initializing: Promise<void> | null = null;
 const IDENTITIES = "ai_phone_user_identities_v1";
@@ -15,10 +16,13 @@ const BINDINGS = "ai_phone_bindings_v1";
 function parse<T>(raw: string | undefined | null, fallback: T): T { try { return raw ? JSON.parse(raw) : fallback; } catch { return fallback; } }
 
 export function initializePhoneIdentity(cache: Map<string, string>): Promise<void> {
-  if (readIdentityRuntime()) return Promise.resolve();
+  const state = readIdentityRuntime();
+  if (state?.deletingUserIds.length) return deletePhoneIdentity(state.deletingUserIds[0]);
+  if (state) return Promise.resolve();
   if (initializing) return initializing;
   initializing = (async () => {
-    if (!(await listIdentityRecoveryPoints()).length) await createIdentityRecoveryPoint();
+    // Initialization only assigns namespaces; it does not rewrite legacy data.
+    // A second full copy is optional and must not make a nearly-full phone unusable.
     const identities = parse<Array<{ id: string }>>(cache.get(IDENTITIES), []);
     if (!identities.length) {
       const identity = newDefaultIdentity();
@@ -66,20 +70,21 @@ async function suspendCloud(): Promise<void> {
 let transition: Promise<void> | null = null;
 export function switchPhoneIdentity(userId: string): Promise<void> {
   if (transition) return transition;
-  transition = (async () => {
+  transition = withBackupOperation(async () => {
     const state = readIdentityRuntime();
     if (!state) throw new Error("身份空间尚未初始化");
     if (state.activeUserId === userId) return;
     const next = switchIdentitySpace(state, userId);
+    const { retryFailedKvWrites } = await import("./kv-db");
+    await retryFailedKvWrites();
     // Failed backup/cloud pause leaves the active identity unchanged.
-    if (!(await listIdentityRecoveryPoints()).length) await createIdentityRecoveryPoint();
     pauseIdentityDispatch(true);
     await suspendCloud();
     await retireScheduledWork();
     silenceIdentityRuntime();
     installIdentityRuntime(next);
     requestPhoneSessionRemount();
-  })().finally(() => { transition = null; pauseIdentityDispatch(false); });
+  }).finally(() => { transition = null; pauseIdentityDispatch(false); });
   return transition;
 }
 
@@ -110,43 +115,66 @@ function deleteDatabase(name: string): Promise<void> {
 
 export function deletePhoneIdentity(userId: string): Promise<void> {
   if (transition) return transition;
-  transition = deletePhoneIdentityOnce(userId).finally(() => { transition = null; pauseIdentityDispatch(false); });
+  transition = withBackupOperation(() => deletePhoneIdentityOnce(userId)).finally(() => { transition = null; pauseIdentityDispatch(false); });
   return transition;
 }
 async function deletePhoneIdentityOnce(userId: string): Promise<void> {
   const state = readIdentityRuntime();
   if (!state) throw new Error("身份空间尚未初始化");
   pauseIdentityDispatch(true);
-  await suspendCloud();
+  if (!state.deletingUserIds.includes(userId)) await suspendCloud();
   const deleting = beginIdentityDeletion(state, userId);
   silenceIdentityRuntime();
   installIdentityRuntime(deleting);
   const kv = new Dexie("AiPhoneKvDB"); kv.version(1).stores({ entries: "key" });
   try {
-    const rows = await kv.table<{ key: string; value: string }>("entries").toArray();
+    const table = kv.table<{ key: string; value: string }, string>("entries");
+    const rows = (await table.bulkGet([IDENTITIES, IDENTITY_ACCESS_KEY])).filter((row): row is { key: string; value: string } => Boolean(row));
+    const directory: Array<{ id: string }> = JSON.parse(rows.find(row => row.key === IDENTITIES)?.value || "null");
+    const policies: Record<string, string[]> = JSON.parse(rows.find(row => row.key === IDENTITY_ACCESS_KEY)?.value || "{}");
+    if (!Array.isArray(directory) || directory.some(identity => !identity || typeof identity.id !== "string")
+      || !policies || typeof policies !== "object" || Object.values(policies).some(ids => !Array.isArray(ids))) {
+      throw new Error("身份目录或权限数据损坏，已暂停删除，请先恢复备份");
+    }
     const prefix = `identity:${encodeURIComponent(userId)}:`;
     const owns = (key: string) => userId === state.legacyOwnerId
       ? !key.startsWith("identity:") && !isSharedIdentityKey(key) : key.startsWith(prefix);
-    const removedAssets = await deleteIdentityMedia(userId, state.legacyOwnerId, rows, owns);
-    await purgeIdentityRecoveryData(userId, state.legacyOwnerId, removedAssets);
+    type Deletion = { removedAssets: string[]; databases: string[]; completed: string[] };
+    const journalId = `delete:${userId}`;
+    let journal = await readIdentityOperation<Deletion>(journalId);
     const databases = await indexedDB.databases();
-    for (const entry of databases) {
-      if (!entry.name || identityDatabaseIsShared(entry.name)) continue;
-      const owned = userId === state.legacyOwnerId ? !entry.name.includes("::identity:")
-        : entry.name.endsWith(`::identity:${encodeURIComponent(userId)}`);
-      if (owned) await deleteDatabase(entry.name);
+    if (!journal) {
+      const ownedNames: string[] = [];
+      for (const entry of databases) {
+        if (!entry.name || identityDatabaseIsShared(entry.name)) continue;
+        const owned = userId === state.legacyOwnerId ? !entry.name.includes("::identity:")
+          : entry.name.endsWith(`::identity:${encodeURIComponent(userId)}`);
+        if (owned) ownedNames.push(entry.name);
+      }
+      journal = { removedAssets: await planIdentityMediaDeletion(userId, state.legacyOwnerId, owns), databases: ownedNames, completed: [] };
+      await saveIdentityOperation(journalId, journal);
     }
-    await kv.table("entries").bulkDelete(rows.filter(row => owns(row.key)).map(row => row.key));
+    // Keep media and recovery copies while any database is blocked. The plan
+    // survives a reload, including references from databases already deleted.
+    for (const name of journal.databases) {
+      if (journal.completed.includes(name)) continue;
+      await deleteDatabase(name);
+      journal.completed.push(name);
+      await saveIdentityOperation(journalId, journal);
+    }
+    await table.bulkDelete((await table.toCollection().primaryKeys()).filter(owns));
     for (const key of Object.keys(window.localStorage)) if (owns(key) && key !== "float_identity_runtime_v1") window.localStorage.removeItem(key);
-    const identities = parse<Array<{ id: string }>>(rows.find(row => row.key === IDENTITIES)?.value, []).filter(identity => identity.id !== userId);
+    const identities = directory.filter(identity => identity.id !== userId);
     if (!identities.length) identities.push(newDefaultIdentity());
-    const policies = parse<Record<string, string[]>>(rows.find(row => row.key === IDENTITY_ACCESS_KEY)?.value, {});
     await kv.table("entries").bulkPut([
       { key: IDENTITIES, value: JSON.stringify(identities) },
       { key: IDENTITY_ACCESS_KEY, value: JSON.stringify(Object.fromEntries(Object.entries(policies).map(([charId, ids]) => [charId, ids.filter(id => id !== userId)]))) },
     ]);
+    await removeIdentityMediaIds(journal.removedAssets);
+    await purgeIdentityRecoveryData(userId, state.legacyOwnerId, journal.removedAssets);
     const finished = finishIdentityDeletion(deleting, userId);
     installIdentityRuntime({ ...finished, userIds: identities.map(identity => identity.id), activeUserId: finished.activeUserId ?? identities[0].id });
+    await removeIdentityOperation(journalId);
     requestPhoneSessionRemount();
   } finally { kv.close(); }
 }
